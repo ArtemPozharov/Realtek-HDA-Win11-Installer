@@ -1,0 +1,13 @@
+# Local WHQL driver binaries (distributed via GitHub Releases)
+/drivers/
+
+# Built release archives & checksums
+/dist/
+*.zip
+*.tar.xz
+*.7z
+
+# Execution logs & temporary staging
+*.log
+/backup_drivers/
+/build_stage/

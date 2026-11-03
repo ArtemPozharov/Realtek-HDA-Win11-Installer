@@ -24,6 +24,11 @@
       7. Configures Realtek HD Audio Manager background startup (RTHDVCPL -> RAVCpl64.exe -s),
          restarts Windows Audio live, and applies a scoped PnP DenyDeviceIDs policy
          (DenyDeviceIDsRetroactive = 0) so Windows Update cannot overwrite the working driver.
+      8. Installs a self-contained SYSTEM Scheduled Task (RealtekHDA-ResumeRecovery) and local
+         recovery script (C:\ProgramData\RealtekHDA\Resume-RealtekAudio.ps1) triggered on
+         system resume from Hibernation (S4) / Sleep (Event IDs 1, 107, 507) that performs a
+         clean zero-veto PnP device restart (IRP_MN_START_DEVICE) so the codec and speaker
+         amplifier are fully re-initialized after S4 power loss on modern laptop platforms.
 
 .PARAMETER DriverDir
     Path to the directory containing the extracted WHQL driver binaries (defaults to .\drivers).
@@ -533,6 +538,326 @@ function Start-AudioStack {
     }
 }
 
+function Remove-StaleRealtekSoftwareNodes {
+    $swdPattern = '^SWD\\DRIVERENUM\\.*(REALTEK|FM|WAVES|NAHIMIC|DOLBY)(APO|SRV|APP|HSA)|^SWD\\.*VEN_10EC'
+    $swdIds = New-Object System.Collections.Generic.List[string]
+
+    try {
+        foreach ($d in @(Get-PnpDevice -ErrorAction SilentlyContinue)) {
+            if ($null -ne $d.InstanceId -and $d.InstanceId -match $swdPattern) {
+                if ($swdIds -notcontains [string]$d.InstanceId) {
+                    $swdIds.Add([string]$d.InstanceId)
+                }
+            }
+        }
+    } catch {}
+
+    try {
+        foreach ($c in @(Get-CimInstance -ClassName Win32_PnPEntity -ErrorAction SilentlyContinue)) {
+            if ($null -ne $c.PNPDeviceID -and $c.PNPDeviceID -match $swdPattern) {
+                if ($swdIds -notcontains [string]$c.PNPDeviceID) {
+                    $swdIds.Add([string]$c.PNPDeviceID)
+                }
+            }
+        }
+    } catch {}
+
+    foreach ($id in $swdIds) {
+        Write-Log "Removing UAD software component node: $id" "INFO"
+        $null = & "$env:SystemRoot\System32\pnputil.exe" /remove-device "$id" 2>&1
+    }
+}
+
+function Install-RealtekHibernateResumeTask {
+    <#
+    .SYNOPSIS
+        Deploys a self-contained local recovery script and SYSTEM Scheduled Task that
+        re-initializes the Realtek HDA codec (IRP_MN_START_DEVICE) upon resuming from
+        Hibernation (S4) or Sleep (S3).
+    .DESCRIPTION
+        In RTKVHD64.sys v6.0.1.8186 (June 2017), the D3 -> D0 power restoration path
+        (PowerChangeState / ALC256::SetPowerState) gates widget and external amplifier
+        unmuting on a 2017 OEM Subsystem ID lookup table. On newer laptops (e.g., HP
+        SUBSYS_103C8DFB), resuming from Hibernation (S4) only sends IRP_MN_SET_POWER
+        (D3 -> D0) without IRP_MN_START_DEVICE, leaving the physical speaker amplifier
+        uninitialized after S4 power loss while Windows Audio reports the endpoint as
+        active. Performing a clean PnP device restart (with Audiosrv stopped to prevent
+        handle vetoes) forces IRP_MN_START_DEVICE (HardWareInit + ResetAudioFgOnStart)
+        and restores audio immediately upon wake.
+    #>
+    $recoveryDir        = Join-Path $env:ProgramData "RealtekHDA"
+    $recoveryScriptPath = Join-Path $recoveryDir "Resume-RealtekAudio.ps1"
+    $taskName           = "RealtekHDA-ResumeRecovery"
+
+    New-Item -ItemType Directory -Path $recoveryDir -Force | Out-Null
+
+    $recoveryScriptContent = @'
+<#
+.SYNOPSIS
+    Automated post-hibernation (S4) / sleep resume recovery for Realtek High Definition Audio (6.0.1.8186).
+    Forces a clean zero-veto PnP device restart (IRP_MN_START_DEVICE) so RTKVHD64.sys runs full
+    HardWareInit and restores speaker amplifier state after S4 power loss.
+#>
+[CmdletBinding()]
+param(
+    [switch]$ManualTest
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+
+$StateDir  = Join-Path $env:ProgramData "RealtekHDA"
+$LogFile   = Join-Path $StateDir "Resume-RealtekAudio.log"
+$StateFile = Join-Path $StateDir "last-recovery-state.json"
+
+function Write-ResumeLog {
+    param([string]$Message, [string]$Level = "INFO")
+    try {
+        if (Test-Path -LiteralPath $LogFile) {
+            $fi = Get-Item -LiteralPath $LogFile -ErrorAction SilentlyContinue
+            if ($null -ne $fi -and $fi.Length -gt 262144) {
+                Move-Item -LiteralPath $LogFile -Destination "$LogFile.old" -Force -ErrorAction SilentlyContinue
+            }
+        }
+        $ts = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss.fff")
+        Add-Content -LiteralPath $LogFile -Value "[$ts] [$Level] $Message" -Encoding UTF8 -ErrorAction SilentlyContinue
+    } catch {}
+}
+
+function Get-WakeEventStatus {
+    $queryXml = @"
+<QueryList>
+  <Query Id="0" Path="System">
+    <Select Path="System">*[System[Provider[@Name='Microsoft-Windows-Power-Troubleshooter'] and (EventID=1)]]</Select>
+    <Select Path="System">*[System[Provider[@Name='Microsoft-Windows-Kernel-Power'] and (EventID=107)]]</Select>
+    <Select Path="System">*[System[Provider[@Name='Microsoft-Windows-Kernel-Power'] and (EventID=507)]] and *[EventData[Data[@Name='Reason']='25']]</Select>
+  </Query>
+</QueryList>
+"@
+    $events = @(Get-WinEvent -FilterXml $queryXml -MaxEvents 6 -ErrorAction SilentlyContinue)
+    $maxRecordId    = [int64]0
+    $max107RecordId = [int64]0
+    $maxCompletionRecordId = [int64]0
+
+    foreach ($ev in $events) {
+        $recId = [int64]$ev.RecordId
+        if ($recId -gt $maxRecordId) { $maxRecordId = $recId }
+        if ($ev.Id -eq 107) {
+            if ($recId -gt $max107RecordId) { $max107RecordId = $recId }
+        } else {
+            # Event ID 1 (Power-Troubleshooter) or Event ID 507 (Reason=25: Resume from Hibernate)
+            if ($recId -gt $maxCompletionRecordId) { $maxCompletionRecordId = $recId }
+        }
+    }
+
+    return [PSCustomObject]@{
+        MaxRecordId           = $maxRecordId
+        Max107RecordId        = $max107RecordId
+        MaxCompletionRecordId = $maxCompletionRecordId
+    }
+}
+
+$mutex = $null
+$hasHandle = $false
+try {
+    $mutex = New-Object System.Threading.Mutex($false, "Global\RealtekHDA_ResumeRecovery_Mutex")
+    try {
+        $hasHandle = $mutex.WaitOne(30000)
+    } catch [System.Threading.AbandonedMutexException] {
+        $hasHandle = $true
+    }
+
+    if (-not $hasHandle) {
+        Write-ResumeLog "Timed out waiting for recovery mutex; exiting." "WARN"
+        exit 0
+    }
+
+    $wakeStatus = Get-WakeEventStatus
+
+    # If triggered early by Kernel-Power 107 while DriverInitDuration (D3 -> D0) is still in progress,
+    # wait monotonically (immune to RTC clock sync jumps) until Power-Troubleshooter 1 or Kernel-Power 507 is logged.
+    if (-not $ManualTest -and $wakeStatus.Max107RecordId -gt $wakeStatus.MaxCompletionRecordId) {
+        Write-ResumeLog "Kernel resume (RecordId=$($wakeStatus.Max107RecordId)) detected; waiting for D0 driver initialization to complete..." "INFO"
+        $waitSw = [System.Diagnostics.Stopwatch]::StartNew()
+        while ($waitSw.ElapsedMilliseconds -lt 10000) {
+            Start-Sleep -Milliseconds 250
+            $wakeStatus = Get-WakeEventStatus
+            if ($wakeStatus.MaxCompletionRecordId -gt $wakeStatus.Max107RecordId) {
+                Write-ResumeLog "D0 transition complete (RecordId=$($wakeStatus.MaxCompletionRecordId), waited $($waitSw.ElapsedMilliseconds) ms)." "INFO"
+                break
+            }
+        }
+    }
+
+    # Check if this wake cycle was already handled by an earlier trigger in the same resume sequence
+    if (-not $ManualTest -and $wakeStatus.MaxRecordId -gt 0 -and (Test-Path -LiteralPath $StateFile)) {
+        try {
+            $saved = Get-Content -LiteralPath $StateFile -Raw -ErrorAction SilentlyContinue | ConvertFrom-Json -ErrorAction SilentlyContinue
+            if ($null -ne $saved -and $null -ne $saved.PSObject.Properties['LastWakeRecordId']) {
+                $lastHandled = [int64]$saved.LastWakeRecordId
+                if ($wakeStatus.MaxRecordId -le $lastHandled) {
+                    Write-ResumeLog "Wake cycle RecordId=$($wakeStatus.MaxRecordId) already recovered (LastWakeRecordId=$lastHandled); skipping duplicate trigger." "INFO"
+                    exit 0
+                }
+            }
+        } catch {}
+    }
+
+    if (-not $ManualTest) {
+        Start-Sleep -Milliseconds 500
+    }
+
+    $rtkDevices = @(Get-CimInstance -ClassName Win32_PnPEntity -ErrorAction SilentlyContinue | Where-Object {
+        $null -ne $_.PNPDeviceID -and
+        $_.PNPDeviceID -match '^(HDAUDIO|INTELAUDIO)\\FUNC_01&VEN_10EC&DEV_' -and
+        $_.Service -ieq 'IntcAzAudAddService'
+    })
+
+    if ($rtkDevices.Count -eq 0) {
+        Write-ResumeLog "No active Realtek HDA (IntcAzAudAddService) codec found; nothing to recover." "INFO"
+        exit 0
+    }
+
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    Write-ResumeLog "Starting post-resume hardware re-initialization for $($rtkDevices.Count) Realtek codec(s)..." "INFO"
+
+    # Stop Windows Audio services so open WaveRT handles cannot veto IRP_MN_QUERY_REMOVE_DEVICE
+    foreach ($svcName in @("Audiosrv", "AudioEndpointBuilder")) {
+        Stop-Service -Name $svcName -Force -ErrorAction SilentlyContinue
+    }
+    Get-Process -Name "audiodg" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Milliseconds 300
+
+    foreach ($dev in $rtkDevices) {
+        $instId = [string]$dev.PNPDeviceID
+        Write-ResumeLog "Restarting PnP device node: $instId" "INFO"
+        $pnpOut = & "$env:SystemRoot\System32\pnputil.exe" /restart-device "$instId" 2>&1
+        $pnpExit = $LASTEXITCODE
+
+        # Verify DevNodeStatus has DN_STARTED (0x08) and not DN_NEED_RESTART (0x100)
+        $statProp = Get-PnpDeviceProperty -InstanceId $instId -KeyName "DEVPKEY_Device_DevNodeStatus" -ErrorAction SilentlyContinue
+        $devStatusBits = if ($null -ne $statProp -and $null -ne $statProp.PSObject.Properties['Data']) { [uint32]$statProp.Data } else { [uint32]0 }
+        $isStarted   = (($devStatusBits -band 0x00000008) -ne 0)
+        $needRestart = (($devStatusBits -band 0x00000100) -ne 0) -or (($devStatusBits -band 0x00000800) -ne 0)
+
+        if ($pnpExit -ne 0 -or -not $isStarted -or $needRestart) {
+            Write-ResumeLog "pnputil /restart-device returned code $pnpExit (DevNodeStatus=0x$('{0:X8}' -f $devStatusBits)); falling back to Disable/Enable-PnpDevice..." "WARN"
+            Disable-PnpDevice -InstanceId $instId -Confirm:$false -ErrorAction SilentlyContinue
+            Start-Sleep -Milliseconds 400
+            Enable-PnpDevice -InstanceId $instId -Confirm:$false -ErrorAction SilentlyContinue
+            Start-Sleep -Milliseconds 400
+        }
+    }
+
+    foreach ($svcName in @("AudioEndpointBuilder", "Audiosrv")) {
+        Set-Service -Name $svcName -StartupType Automatic -ErrorAction SilentlyContinue
+        Start-Service -Name $svcName -ErrorAction SilentlyContinue
+    }
+
+    $postWakeStatus = Get-WakeEventStatus
+    $finalRecordId = [Math]::Max($wakeStatus.MaxRecordId, $postWakeStatus.MaxRecordId)
+    if ($finalRecordId -gt 0) {
+        @{
+            LastWakeRecordId = $finalRecordId
+            LastRecoveryUtc  = [DateTime]::UtcNow.ToString("o")
+        } | ConvertTo-Json | Set-Content -LiteralPath $StateFile -Encoding UTF8 -Force
+    }
+
+    $sw.Stop()
+    Write-ResumeLog "Post-resume Realtek HDA hardware re-initialization completed in $($sw.ElapsedMilliseconds) ms (RecordId=$finalRecordId)." "OK"
+} catch {
+    Write-ResumeLog "Post-resume recovery error: $($_.Exception.Message)" "ERROR"
+    foreach ($svcName in @("AudioEndpointBuilder", "Audiosrv")) {
+        Start-Service -Name $svcName -ErrorAction SilentlyContinue
+    }
+    exit 1
+} finally {
+    if ($hasHandle -and $null -ne $mutex) {
+        try { $mutex.ReleaseMutex() } catch {}
+    }
+    if ($null -ne $mutex) {
+        $mutex.Dispose()
+    }
+}
+'@
+
+    Set-Content -LiteralPath $recoveryScriptPath -Value $recoveryScriptContent -Encoding UTF8 -Force
+
+    # Initialize state file with current highest wake EventRecordID so historical events do not re-trigger
+    try {
+        $initXml = @"
+<QueryList>
+  <Query Id="0" Path="System">
+    <Select Path="System">*[System[Provider[@Name='Microsoft-Windows-Power-Troubleshooter'] and (EventID=1)]]</Select>
+    <Select Path="System">*[System[Provider[@Name='Microsoft-Windows-Kernel-Power'] and (EventID=107)]]</Select>
+    <Select Path="System">*[System[Provider[@Name='Microsoft-Windows-Kernel-Power'] and (EventID=507)]] and *[EventData[Data[@Name='Reason']='25']]</Select>
+  </Query>
+</QueryList>
+"@
+        $latestEv = @(Get-WinEvent -FilterXml $initXml -MaxEvents 1 -ErrorAction SilentlyContinue)
+        if ($latestEv.Count -gt 0) {
+            $stateFilePath = Join-Path $recoveryDir "last-recovery-state.json"
+            @{
+                LastWakeRecordId = [int64]$latestEv[0].RecordId
+                LastRecoveryUtc  = [DateTime]::UtcNow.ToString("o")
+            } | ConvertTo-Json | Set-Content -LiteralPath $stateFilePath -Encoding UTF8 -Force
+        }
+    } catch {}
+
+    $psExe = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
+    $taskArgs = "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$recoveryScriptPath`""
+
+    $taskXml = @"
+<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>Re-initializes the Realtek High Definition Audio codec (IRP_MN_START_DEVICE) upon resuming from Windows Hibernation (S4) or Sleep so speaker amplifier state is restored after power loss.</Description>
+    <URI>\$taskName</URI>
+  </RegistrationInfo>
+  <Triggers>
+    <EventTrigger>
+      <Enabled>true</Enabled>
+      <Subscription>&lt;QueryList&gt;&lt;Query Id="0" Path="System"&gt;&lt;Select Path="System"&gt;*[System[Provider[@Name='Microsoft-Windows-Power-Troubleshooter'] and (EventID=1)]]&lt;/Select&gt;&lt;Select Path="System"&gt;*[System[Provider[@Name='Microsoft-Windows-Kernel-Power'] and (EventID=107)]]&lt;/Select&gt;&lt;Select Path="System"&gt;*[System[Provider[@Name='Microsoft-Windows-Kernel-Power'] and (EventID=507)]] and *[EventData[Data[@Name='Reason']='25']]&lt;/Select&gt;&lt;/Query&gt;&lt;/QueryList&gt;</Subscription>
+    </EventTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <UserId>S-1-5-18</UserId>
+      <RunLevel>HighestAvailable</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <IdleSettings>
+      <StopOnIdleEnd>false</StopOnIdleEnd>
+      <RestartOnIdle>false</RestartOnIdle>
+    </IdleSettings>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>false</Hidden>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <WakeToRun>false</WakeToRun>
+    <ExecutionTimeLimit>PT2M</ExecutionTimeLimit>
+    <Priority>4</Priority>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>$psExe</Command>
+      <Arguments>$taskArgs</Arguments>
+    </Exec>
+  </Actions>
+</Task>
+"@
+
+    $null = Register-ScheduledTask -TaskName $taskName -TaskPath "\" -Xml $taskXml -Force -ErrorAction Stop
+    Write-Log "Configured S4 hibernation resume recovery task (\$taskName -> $recoveryScriptPath)." "OK"
+}
+
 # ==============================================================================
 # ENTRY POINT
 # ==============================================================================
@@ -675,6 +1000,8 @@ if (-not $ForceReinstall) {
     }
     if ($allAlreadyClean) {
         Write-Log "Clean Realtek driver v$TargetDriverVersion is already installed and healthy. Use -ForceReinstall to reinstall." "OK"
+        Remove-StaleRealtekSoftwareNodes
+        Install-RealtekHibernateResumeTask
         if (-not $SkipWindowsUpdateLock) {
             $lockIds = [string[]]@(
                 $validTargets | ForEach-Object {
@@ -746,17 +1073,7 @@ try {
 
     # 7. Stop audio stack and purge conflicting UAD / Extension packages from DriverStore
     Stop-AudioStackForLiveSwap
-
-    $swdChildren = @(Get-CimInstance -ClassName Win32_PnPEntity -ErrorAction SilentlyContinue | Where-Object {
-        $null -ne $_.PNPDeviceID -and (
-            $_.PNPDeviceID -match '^SWD\\DRIVERENUM\\.*(REALTEK|FM|WAVES|NAHIMIC|DOLBY)(APO|SRV|APP|HSA)' -or
-            $_.PNPDeviceID -match '^SWD\\.*VEN_10EC'
-        )
-    })
-    foreach ($swd in $swdChildren) {
-        Write-Log "Removing UAD software component: $($swd.PNPDeviceID)" "INFO"
-        $null = & "$env:SystemRoot\System32\pnputil.exe" /remove-device "$($swd.PNPDeviceID)" 2>&1
-    }
+    Remove-StaleRealtekSoftwareNodes
 
     $conflictingOems = @(Get-ConflictingRealtekOemInfs)
     if ($conflictingOems.Count -gt 0) {
@@ -766,6 +1083,8 @@ try {
             $null = & "$env:SystemRoot\System32\pnputil.exe" /delete-driver $oem.OemInf /uninstall /force 2>&1
         }
     }
+
+    Remove-StaleRealtekSoftwareNodes
 
     # Reset the codec devnode and rescan the audio bus to clear any stale UAD ExtendedInfs entries in Enum
     Stop-AudioStackForLiveSwap
@@ -848,8 +1167,10 @@ try {
         }
     }
 
-    # 10. Restart Windows Audio stack and launch tray agent (only in interactive user sessions, not Session 0)
+    # 10. Restart Windows Audio stack, register S4 hibernate resume recovery, and launch tray agent
+    Remove-StaleRealtekSoftwareNodes
     Start-AudioStack
+    Install-RealtekHibernateResumeTask
     if (Test-Path -LiteralPath $ravCplPath) {
         if (Test-IsInteractiveSession) {
             Start-Process -FilePath $ravCplPath -ArgumentList "-s" -WindowStyle Hidden -ErrorAction SilentlyContinue
